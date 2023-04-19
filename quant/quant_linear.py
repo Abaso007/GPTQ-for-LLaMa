@@ -29,7 +29,6 @@ try:
             'top_k': None,
         },
     )
-    
     @triton.jit
     def matmul_248_kernel(a_ptr, b_ptr, c_ptr,
                           scales_ptr, zeros_ptr, g_ptr,
@@ -73,21 +72,21 @@ try:
         # shifter is used to extract the N bits of each element in the 32-bit word from B
         scales_ptrs = scales_ptr + offs_bn[None, :]
         zeros_ptrs = zeros_ptr + (offs_bn[None, :]// infearure_per_bits) 
-        
+
         shifter = (offs_k % infearure_per_bits) * bits
         zeros_shifter = (offs_bn % infearure_per_bits) * bits
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-                
-        for k in range(0, num_pid_k):
+
+        for _ in range(num_pid_k):
             g_idx = tl.load(g_ptrs)
 
             # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
             scales = tl.load(scales_ptrs + g_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
             zeros = tl.load(zeros_ptrs + g_idx[:, None] * stride_zeros)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
-            
+
             zeros = (zeros >> zeros_shifter[None, :]) & maxq
             zeros = (zeros + 1)
-            
+
             a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
             b = tl.load(b_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
 
@@ -118,7 +117,6 @@ try:
         key=['M', 'N', 'K'],
         nearest_power_of_two=True
     )
-    
     @triton.jit
     def transpose_matmul_248_kernel(a_ptr, b_ptr, c_ptr,
                                     scales_ptr, zeros_ptr, g_ptr,
@@ -160,23 +158,23 @@ try:
         b_ptrs = b_ptr + ((offs_bk[:, None] // infearure_per_bits) * stride_bk + offs_n[None, :] * stride_bn)   # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         g_ptrs = g_ptr + offs_bk
         g_idx = tl.load(g_ptrs)
-        
+
         # shifter is used to extract the N bits of each element in the 32-bit word from B
         scales_ptrs = scales_ptr + offs_n[None, :]  + g_idx[:, None] * stride_scales
         zeros_ptrs = zeros_ptr + (offs_n[None, :]// infearure_per_bits) + g_idx[:, None] * stride_zeros
-        
+
         shifter = (offs_bk % infearure_per_bits) * bits
         zeros_shifter = (offs_n % infearure_per_bits) * bits
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_K), dtype=tl.float32)
-        
-        for k in range(0, num_pid_n):
+
+        for _ in range(num_pid_n):
             # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
             scales = tl.load(scales_ptrs)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
             zeros = tl.load(zeros_ptrs)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
-            
+
             zeros = (zeros >> zeros_shifter[None, :]) & maxq
             zeros = (zeros + 1)
-            
+
             a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_N)
             b = tl.load(b_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
 
@@ -190,7 +188,7 @@ try:
             b_ptrs += BLOCK_SIZE_N
             scales_ptrs += BLOCK_SIZE_N
             zeros_ptrs += (BLOCK_SIZE_N // infearure_per_bits)
-            
+
         c_ptrs = c_ptr + stride_cm * offs_am[:, None] + stride_cn * offs_bk[None, :]
         c_mask = (offs_am[:, None] < M) & (offs_bk[None, :] < K)
         tl.store(c_ptrs, accumulator, mask=c_mask)
@@ -266,17 +264,21 @@ class QuantLinear(nn.Module):
         
     def pack(self, linear, scales, zeros, g_idx = None):
         self.g_idx = g_idx.clone() if g_idx is not None else self.g_idx
-        
+
         scales = scales.t().contiguous()
         zeros = zeros.t().contiguous()
         scale_zeros = zeros * scales
         self.scales = scales.clone().half()
         if linear.bias is not None:
             self.bias = linear.bias.clone().half()
-            
-        intweight = []
-        for idx in range(self.infeatures):
-            intweight.append(torch.round((linear.weight.data[:,idx] + scale_zeros[self.g_idx[idx]]) / self.scales[self.g_idx[idx]]).to(torch.int)[:,None])
+
+        intweight = [
+            torch.round(
+                (linear.weight.data[:, idx] + scale_zeros[self.g_idx[idx]])
+                / self.scales[self.g_idx[idx]]
+            ).to(torch.int)[:, None]
+            for idx in range(self.infeatures)
+        ]
         intweight = torch.cat(intweight,dim=1)
         intweight = intweight.t().contiguous()
         intweight = intweight.numpy().astype(np.uint32)
@@ -284,31 +286,29 @@ class QuantLinear(nn.Module):
         i = 0
         row = 0
         while row < qweight.shape[0]:
-            if self.bits in [2,4,8]:
-                for j in range(i, i + (32//self.bits)):
-                    qweight[row] |= intweight[j] << (self.bits * (j - i))
-                i += 32//self.bits
-                row += 1
-            else:
+            if self.bits not in [2, 4, 8]:
                 raise NotImplementedError("Only 2,4,8 bits are supported.")
-                
+
+            for j in range(i, i + (32//self.bits)):
+                qweight[row] |= intweight[j] << (self.bits * (j - i))
+            i += 32//self.bits
+            row += 1
         qweight = qweight.astype(np.int32)
         self.qweight = torch.from_numpy(qweight) 
-        
+
         zeros -= 1;
         zeros = zeros.numpy().astype(np.uint32)
         qzeros = np.zeros((zeros.shape[0], zeros.shape[1] // 32 * self.bits), dtype=np.uint32)
         i = 0
         col = 0
         while col < qzeros.shape[1]:
-            if self.bits in [2,4,8]:
-                for j in range(i, i + (32//self.bits)):
-                    qzeros[:, col] |= zeros[:, j] << (self.bits * (j - i))
-                i += 32//self.bits
-                col += 1
-            else:
+            if self.bits not in [2, 4, 8]:
                 raise NotImplementedError("Only 2,4,8 bits are supported.")
-                
+
+            for j in range(i, i + (32//self.bits)):
+                qzeros[:, col] |= zeros[:, j] << (self.bits * (j - i))
+            i += 32//self.bits
+            col += 1
         qzeros = qzeros.astype(np.int32)
         self.qzeros = torch.from_numpy(qzeros) 
         
@@ -324,12 +324,18 @@ def make_quant_linear(module, names, bits, groupsize, name=''):
         return
     for attr in dir(module):
         tmp = getattr(module, attr)
-        name1 = name + '.' + attr if name != '' else attr
+        name1 = f'{name}.{attr}' if name != '' else attr
         if name1 in names:
             delattr(module, attr)
             setattr(module, attr, QuantLinear(bits, groupsize, tmp.in_features, tmp.out_features, tmp.bias is not None))
     for name1, child in module.named_children():
-        make_quant_linear(child, names, bits, groupsize, name + '.' + name1 if name != '' else name1)
+        make_quant_linear(
+            child,
+            names,
+            bits,
+            groupsize,
+            f'{name}.{name1}' if name != '' else name1,
+        )
         
 def autotune_warmup_linear(model, transpose = False):
     """
@@ -345,7 +351,7 @@ def autotune_warmup_linear(model, transpose = False):
 
         k = m.infeatures
         n = m.outfeatures
-        
+
         if (k, n) not in kn_values:
             kn_values[(k, n)] = (m.qweight.cuda(), m.scales.cuda(), m.qzeros.cuda(), m.g_idx.cuda(), m.bits, m.maxq)
 
@@ -353,7 +359,7 @@ def autotune_warmup_linear(model, transpose = False):
 
     print('Warming up autotune cache ...')
     with torch.no_grad():
-        for m in tqdm(range(0, 12)):
+        for m in tqdm(range(12)):
             m = 2 ** m   # [1, 2048]
             for (k, n), (qweight, scales, qzeros, g_idx, bits, maxq) in kn_values.items():
                 a = torch.randn(m, k, dtype=torch.float16, device='cuda')

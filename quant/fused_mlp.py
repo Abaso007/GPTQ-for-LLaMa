@@ -30,7 +30,6 @@ try:
             'top_k': None,
         },
     )
-    
     @triton.jit
     def fusedmatmul_248_kernel(a_ptr, c_ptr,
                                b1_ptr, scales1_ptr, zeros1_ptr, g1_ptr,
@@ -76,42 +75,42 @@ try:
         # shifter is used to extract the N bits of each element in the 32-bit word from B
         scales1_ptrs = scales1_ptr + offs_bn[None, :]
         scales2_ptrs = scales2_ptr + offs_bn[None, :]
-        zeros1_ptrs = zeros1_ptr + (offs_bn[None, :]// infearure_per_bits) 
+        zeros1_ptrs = zeros1_ptr + (offs_bn[None, :]// infearure_per_bits)
         zeros2_ptrs = zeros2_ptr + (offs_bn[None, :]// infearure_per_bits) 
-        
+
         shifter = (offs_k % infearure_per_bits) * bits
         zeros_shifter = (offs_bn % infearure_per_bits) * bits
         accumulator1 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
         accumulator2 = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-        for k in range(0, num_pid_k):
+        for _ in range(num_pid_k):
             g1_idx = tl.load(g1_ptrs)
             g2_idx = tl.load(g2_ptrs)
 
             # Fetch scales and zeros; these are per-outfeature and thus reused in the inner loop
             scales1 = tl.load(scales1_ptrs + g1_idx[:, None] * stride_scales)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
             scales2 = tl.load(scales2_ptrs + g2_idx[:, None] * stride_scales)
-            
+
             zeros1 = tl.load(zeros1_ptrs + g1_idx[:, None] * stride_zeros)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
             zeros1 = (zeros1 >> zeros_shifter[None, :]) & maxq
             zeros1 = (zeros1 + 1)
-            
+
             zeros2 = tl.load(zeros2_ptrs + g2_idx[:, None] * stride_zeros)  # (BLOCK_SIZE_K, BLOCK_SIZE_N,)
             zeros2 = (zeros2 >> zeros_shifter[None, :]) & maxq
             zeros2 = (zeros2 + 1)
-            
+
             a = tl.load(a_ptrs, mask=a_mask, other=0.)   # (BLOCK_SIZE_M, BLOCK_SIZE_K)
             b1 = tl.load(b1_ptrs)   # (BLOCK_SIZE_K, BLOCK_SIZE_N), but repeated
             b2 = tl.load(b2_ptrs)
-            
+
             # Now we need to unpack b (which is N-bit values) into 32-bit values
             b1 = (b1 >> shifter[:, None]) & maxq  # Extract the N-bit values
             b1 = (b1 - zeros1) * scales1  # Scale and shift
             accumulator1 += tl.dot(a, b1)
-            
+
             b2 = (b2 >> shifter[:, None]) & maxq
             b2 = (b2 - zeros2) * scales2
             accumulator2 += tl.dot(a, b2)
-            
+
             a_ptrs += BLOCK_SIZE_K
             b1_ptrs += (BLOCK_SIZE_K // infearure_per_bits) * stride_bk
             b2_ptrs += (BLOCK_SIZE_K // infearure_per_bits) * stride_bk
@@ -219,7 +218,7 @@ def autotune_warmup_fused(model):
 
         k = m.infeatures
         n = m.intermediate_size
-        
+
         m.fused2cuda()
         if (k, n) not in kn_values:
             kn_values[(k, n)] = m
@@ -228,12 +227,12 @@ def autotune_warmup_fused(model):
 
     print('Warming up autotune cache ...')
     with torch.no_grad():
-        for m in tqdm(range(0, 12)):
+        for m in tqdm(range(12)):
             m = 2 ** m   # [1, 2048]
             for (k, n), (modules) in kn_values.items():
                 a = torch.randn(m, k, dtype=torch.float16, device='cuda')
                 modules.triton_llama_mlp(a)
-                
+
         for (k, n), (modules) in kn_values.items():
             a = torch.randn(m, k, dtype=torch.float16, device='cuda')
             modules.fused2cpu()

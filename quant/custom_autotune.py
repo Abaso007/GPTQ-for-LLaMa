@@ -19,10 +19,9 @@ class Autotuner(triton.KernelInterface):
 			'prune_num_stages_by'(optional): a function used to prune num_stages. It take configs:List[Config] as its input, and returns pruned configs.
 			'nearest_power_of_two'(optional): whether to round key arguments to the nearest power of two when caching tuning results
 		'''
-		if not configs:
-			self.configs = [triton.Config({}, num_warps=4, num_stages=2)]
-		else:
-			self.configs = configs
+		self.configs = (
+			configs if configs else [triton.Config({}, num_warps=4, num_stages=2)]
+		)
 		self.key_idx = [arg_names.index(k) for k in key]
 		self.nearest_power_of_two = nearest_power_of_two
 		self.cache = {}
@@ -79,8 +78,8 @@ class Autotuner(triton.KernelInterface):
 			# This reduces the amount of autotuning by rounding the keys to the nearest power of two
 			# In my testing this gives decent results, and greatly reduces the amount of tuning required
 			if self.nearest_power_of_two:
-				key = tuple([2 ** int(math.log2(x) + 0.5) for x in key])
-			
+				key = tuple(2 ** int(math.log2(x) + 0.5) for x in key)
+
 			if key not in self.cache:
 				# prune configs
 				pruned_configs = self.prune_configs(kwargs)

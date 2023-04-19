@@ -19,12 +19,16 @@ def main():
     args = parser.parse_args()
     if args.model_size != "tokenizer_only":
         write_model(
-            model_path=os.path.join(args.output_dir, "llama-{}".format(args.model_size).lower()),
+            model_path=os.path.join(
+                args.output_dir, f"llama-{args.model_size}".lower()
+            ),
             input_base_path=os.path.join(args.input_dir, args.model_size),
             model_size=args.model_size,
         )
     write_tokenizer(
-        tokenizer_path=os.path.join(args.output_dir, "llama-{}".format(args.model_size).lower()),
+        tokenizer_path=os.path.join(
+            args.output_dir, f"llama-{args.model_size}".lower()
+        ),
         input_tokenizer_path=os.path.join(args.input_dir, "tokenizer.model"),
     )
 
